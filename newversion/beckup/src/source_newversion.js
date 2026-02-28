@@ -1,4 +1,5 @@
 import { NAV_KEYS, loadNavigationState } from '../../src/storage/db_nav.js';
+import { tableStoreKeys } from '../../src/modules/table_store.js';
 
 function toColumnsFromPayload(payload) {
   if (!Array.isArray(payload?.sheet?.columns)) return [];
@@ -55,9 +56,21 @@ export function createNewversionSourceAdapter(storage, { tableDatasetPrefix = 't
     return `${tableDatasetPrefix}${journalId}`;
   }
 
-  async function saveRecordsToJournal(journalId, incomingRecords, { mode = 'merge' } = {}) {
-    const key = datasetKey(journalId);
-    const current = await storage.get(key);
+  async function loadDatasetV2(journalId) {
+    const meta = await storage.get(tableStoreKeys.meta(journalId));
+    if (!meta) return null;
+    const rawOrder = await storage.get(tableStoreKeys.order(journalId));
+    const order = Array.isArray(rawOrder) ? rawOrder : [];
+    const records = [];
+    for (const rid of order) {
+      const rec = await storage.get(tableStoreKeys.record(journalId, rid));
+      if (rec) records.push(rec);
+    }
+    return { journalId, meta, records };
+  }
+
+  async function saveDatasetV2(journalId, incomingRecords, { mode = 'merge' } = {}) {
+    const current = await loadDatasetV2(journalId);
     const currentRecords = Array.isArray(current?.records) ? current.records : [];
 
     let records;
@@ -69,12 +82,45 @@ export function createNewversionSourceAdapter(storage, { tableDatasetPrefix = 't
       records = [...byId.values()];
     }
 
+    const order = records.map((r) => r.id);
+    const rawPrevOrder = await storage.get(tableStoreKeys.order(journalId));
+    const prevOrder = Array.isArray(rawPrevOrder) ? rawPrevOrder : [];
+    const keep = new Set(order.map(String));
+
+    await storage.set(tableStoreKeys.meta(journalId), {
+      ...(current?.meta || {}),
+      updatedAt: new Date().toISOString(),
+      revision: Number(current?.meta?.revision ?? 0) + 1
+    });
+    await storage.set(tableStoreKeys.order(journalId), order);
+    for (const r of records) await storage.set(tableStoreKeys.record(journalId, r.id), r);
+    for (const rid of prevOrder) {
+      if (!keep.has(String(rid))) await storage.del(tableStoreKeys.record(journalId, rid));
+    }
+
+    const rawIndex = await storage.get(tableStoreKeys.index);
+    const idx = Array.isArray(rawIndex) ? rawIndex : [];
+    const ids = idx
+      .map((item) => (typeof item === 'string' ? item : item?.journalId))
+      .filter(Boolean);
+    if (!ids.includes(journalId)) {
+      await storage.set(tableStoreKeys.index, [...ids, journalId]);
+    }
+  }
+
+  async function saveRecordsToJournal(journalId, incomingRecords, { mode = 'merge' } = {}) {
+    await saveDatasetV2(journalId, incomingRecords, { mode });
+
+    // Backward-compat mirror for old exports that still read tableStore:dataset:*.
+    const key = datasetKey(journalId);
+    const legacyCurrent = await storage.get(key);
+    const persisted = await loadDatasetV2(journalId);
     await storage.set(key, {
-      ...(current || {}),
+      ...(legacyCurrent || {}),
       journalId,
-      schema: current?.schema || null,
-      records,
-      merges: Array.isArray(current?.merges) ? current.merges : []
+      schema: legacyCurrent?.schema || null,
+      records: Array.isArray(persisted?.records) ? persisted.records : incomingRecords,
+      merges: Array.isArray(legacyCurrent?.merges) ? legacyCurrent.merges : []
     });
   }
 
@@ -84,12 +130,12 @@ export function createNewversionSourceAdapter(storage, { tableDatasetPrefix = 't
     },
 
     async loadJournalSchema(journalId) {
-      const dataset = await storage.get(datasetKey(journalId));
+      const dataset = await loadDatasetV2(journalId) || await storage.get(datasetKey(journalId));
       return dataset?.schema || { fields: [] };
     },
 
     async loadJournalRecords(journalId) {
-      const dataset = await storage.get(datasetKey(journalId));
+      const dataset = await loadDatasetV2(journalId) || await storage.get(datasetKey(journalId));
       return Array.isArray(dataset?.records) ? dataset.records : [];
     },
 
