@@ -744,6 +744,57 @@ export function createModuleManagerUI({ sdo, mount, api }) {
       }, []);
     }
 
+    function openImportTraceModal({ title = 'Імпорт JSON', fileName = '', journalId = '', stages = [], payload = null }) {
+      if (!window.UI?.modal?.open) return;
+      const content = document.createElement('div');
+      content.className = 'ui-modal-content';
+
+      const meta = document.createElement('div');
+      meta.style.marginBottom = '10px';
+      meta.style.fontSize = '12px';
+      meta.style.opacity = '0.9';
+      meta.innerHTML = `Файл: <b>${fileName || 'unknown.json'}</b><br/>journalId: <b>${journalId || 'n/a'}</b>`;
+
+      const list = document.createElement('ol');
+      list.style.margin = '0';
+      list.style.paddingLeft = '18px';
+      list.style.display = 'grid';
+      list.style.gap = '8px';
+
+      for (const item of stages) {
+        const li = document.createElement('li');
+        const icon = item.ok ? '✅' : '❌';
+        const short = document.createElement('div');
+        short.innerHTML = `<b>${icon} ${item.step}</b>`;
+        const details = document.createElement('div');
+        details.style.fontSize = '12px';
+        details.style.opacity = '0.85';
+        details.textContent = item.message || '';
+        li.append(short, details);
+        list.append(li);
+      }
+
+      content.append(meta, list);
+
+      if (payload != null) {
+        const debug = document.createElement('details');
+        debug.style.marginTop = '10px';
+        const summary = document.createElement('summary');
+        summary.textContent = 'Debug JSON';
+        const pre = document.createElement('pre');
+        pre.style.maxHeight = '220px';
+        pre.style.overflow = 'auto';
+        pre.style.padding = '8px';
+        pre.style.border = '1px solid var(--border,#ddd)';
+        pre.style.borderRadius = '8px';
+        pre.textContent = JSON.stringify(payload, null, 2);
+        debug.append(summary, pre);
+        content.append(debug);
+      }
+
+      window.UI.modal.open({ title, contentNode: content, closeOnOverlay: true });
+    }
+
     async function exportCurrentJournalJson() {
       const id = getActiveJournalId();
       if (!id) return window.UI?.toast?.show?.('Не обрано журнал (activeJournalId пустий)', { type: 'warning' });
@@ -759,9 +810,20 @@ export function createModuleManagerUI({ sdo, mount, api }) {
       if (!id) return window.UI?.toast?.show?.('Не обрано журнал (activeJournalId пустий)', { type: 'warning' });
       const file = await pickFile({ accept: 'application/json,.json' });
       if (!file) return;
+      const trace = [];
+
       const text = await file.text();
+      trace.push({ step: 'Читання файлу', ok: true, message: `Отримано ${text.length} символів` });
       let parsed;
-      try { parsed = JSON.parse(text); } catch { window.UI?.toast?.show?.('JSON пошкоджений', { type: 'error' }); return; }
+      try {
+        parsed = JSON.parse(text);
+        trace.push({ step: 'Парсинг JSON', ok: true, message: 'JSON синтаксично валідний' });
+      } catch {
+        trace.push({ step: 'Парсинг JSON', ok: false, message: 'JSON пошкоджений або має невалідний синтаксис' });
+        window.UI?.toast?.show?.('JSON пошкоджений', { type: 'error' });
+        openImportTraceModal({ title: 'Імпорт JSON — помилка', fileName: file.name, journalId: id, stages: trace });
+        return;
+      }
 
       // Force import into active journal: take the first dataset.
       const ds0 = parsed?.datasets?.[0] || null;
@@ -769,13 +831,19 @@ export function createModuleManagerUI({ sdo, mount, api }) {
       let bundle = normalized;
       if (!bundle && ds0) {
         bundle = { format: 'sdo-table-data', formatVersion: 1, exportedAt: new Date().toISOString(), datasets: [ds0] };
+        trace.push({ step: 'Нормалізація структури', ok: true, message: 'Використано datasets[0] як sdo-table-data' });
+      } else if (bundle) {
+        trace.push({ step: 'Нормалізація структури', ok: true, message: 'Формат sdo-table-data підтверджено' });
       }
       if (!bundle || !Array.isArray(bundle.datasets) || bundle.datasets.length === 0) {
+        trace.push({ step: 'Валідація bundle', ok: false, message: 'Невідомий формат JSON для таблиці (немає datasets)' });
         window.UI?.toast?.show?.('Невідомий формат JSON для таблиці', { type: 'error' });
+        openImportTraceModal({ title: 'Імпорт JSON — помилка', fileName: file.name, journalId: id, stages: trace, payload: parsed });
         return;
       }
       // Rewrite journalId
       bundle.datasets = bundle.datasets.map((d) => ({ ...d, journalId: id }));
+      trace.push({ step: 'Перепризначення journalId', ok: true, message: `Усі datasets будуть збережені в journalId=${id}` });
 
       let mode = 'replace';
       if (typeof window.UI?.confirm === 'function') {
@@ -784,11 +852,18 @@ export function createModuleManagerUI({ sdo, mount, api }) {
       }
       const res = await sdoInst.api.tableStore.importTableData(bundle, { mode });
       if (res?.applied) {
+        trace.push({ step: 'Запис у tableStore', ok: true, message: `Режим ${mode}, datasets: ${Array.isArray(res?.datasets) ? res.datasets.length : 0}` });
         await forceTableRerender();
+        trace.push({ step: 'Оновлення UI', ok: true, message: 'Таблиця примусово перемальована' });
         const count = Array.isArray(res?.datasets) ? res.datasets.length : 0;
         window.UI?.toast?.show?.(`Імпорт JSON виконано (${mode})${count ? `, datasets: ${count}` : ''}`, { type: 'success' });
+        openImportTraceModal({ title: 'Імпорт JSON — успіх', fileName: file.name, journalId: id, stages: trace, payload: bundle });
       }
-      else window.UI?.toast?.show?.(`Імпорт JSON не виконано: ${(res?.errors || []).join(', ')}`, { type: 'error' });
+      else {
+        trace.push({ step: 'Запис у tableStore', ok: false, message: `Імпорт відхилено: ${(res?.errors || []).join(', ') || 'невідома помилка'}` });
+        window.UI?.toast?.show?.(`Імпорт JSON не виконано: ${(res?.errors || []).join(', ')}`, { type: 'error' });
+        openImportTraceModal({ title: 'Імпорт JSON — помилка', fileName: file.name, journalId: id, stages: trace, payload: bundle });
+      }
     }
 
     async function exportCurrentJournalXlsx() {
